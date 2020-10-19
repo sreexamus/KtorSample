@@ -1,0 +1,2 @@
+com/jetbrains/handson/mpp/ktorsample/android/BuildConfig.java
+ com.jetbrains.handson.mpp.ktorsample.android.BuildConfig
