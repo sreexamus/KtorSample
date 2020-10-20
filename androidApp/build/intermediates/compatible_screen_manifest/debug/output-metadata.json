@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "artifactType": {
+    "type": "COMPATIBLE_SCREEN_MANIFEST",
+    "kind": "Directory"
+  },
+  "applicationId": "com.jetbrains.handson.mpp.ktorsample.androidApp",
+  "variantName": "debug",
+  "elements": []
+}

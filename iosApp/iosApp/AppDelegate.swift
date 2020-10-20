@@ -8,14 +8,18 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         // Override point for customization after application launch.
-        //DispatchQueue.global(qos: .background).async {
-            (0...25).forEach { _ in
-                SpaceXApi().getAllLaunches { (rockets, error) in
-                    print("rockets\(rockets)")
-                    print("Thread name \(Thread.isMainThread)")
-                }
-            }
-       // }
+
+        
+        SpaceXApi().getAllLaunches { (rocks, _) in
+            print("data \(rocks)")
+        }
+//           // (0...15).forEach { _ in
+//                SpaceXApi().getAllLaunches { (rockets, error) in
+//                    print("rockets\(rockets)")
+//                    print("Thread name \(Thread.isMainThread)")
+//                }
+//           // }
+
    
         return true
     }
