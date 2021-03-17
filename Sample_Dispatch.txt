@@ -1,0 +1,267 @@
+
+class DataDispatcher {
+    private let persistenceManager: PersistenceManager
+    private let connector: ServiceConnector
+    private let bundle = GaugeBundle()
+    private let deviceData = UIDeviceData()
+    var eventsDispatchGroup: DispatchGroup?
+    var dataDeletionDispatchGroup: DispatchGroup?
+    var eventNetworkResults: [EventNetworkResult] = []
+    var sessionsFetchedData: [Session] = []
+    var fetchedData: [Gauge] = []
+
+    init(persistenceManager: PersistenceManager, connector: ServiceConnector) {
+        self.persistenceManager = persistenceManager
+        self.connector = connector
+    }
+
+    func flushAllCollectedData(completion: GaugeCompletion? = nil) {
+        initializeGaugeDispatchGroups()
+        self.persistenceManager.coredataManager.performBackgroundTask { [weak self] context in
+            let gauge = self?.persistenceManager.fetchGauge(context: context)
+            guard let gaugeData = gauge?.data,
+                  !gaugeData.isEmpty else {
+                logger.debug(withMessage: "no gauge data available", category: .gauge)
+                completion?(.success(()))
+                return
+            }
+
+            self?.flushAllGaugeData(gaugeData: gaugeData)
+            self?.deleteAllData(context: context,
+                                completion: completion)
+        }
+    }
+
+    func initializeGaugeDispatchGroups() {
+        eventsDispatchGroup = DispatchGroup()
+        dataDeletionDispatchGroup = DispatchGroup()
+        eventNetworkResults = []
+        sessionsFetchedData = []
+        fetchedData = []
+    }
+
+    func deleteAllData(context: NSManagedObjectContext, completion: GaugeCompletion?) {
+        eventsDispatchGroup?.notify(queue: DispatchQueue.global(qos: .background)) { [weak self] in
+            logger.debug(withMessage: "notified event dispatch group", category: .gauge)
+            let allFailedEvents = self?.eventNetworkResults.filter { !$0.isSuccess }
+            let allSuccessfulEvents = self?.eventNetworkResults.filter { $0.isSuccess }
+
+            switch self?.eventNetworkResults.count {
+            case allSuccessfulEvents?.count:
+                /// All events successfully flushed
+                logger.debug(withMessage: "notified batch of events \(String(describing: allSuccessfulEvents?.count)) sent to gauge successfully", category: .gauge)
+                self?.deleteEventsData(context: context, eventResults: self?.eventNetworkResults)
+                self?.deleteGaugeData()
+                self?.deleteSessionsData()
+                completion?(.success(()))
+            case allFailedEvents?.count:
+                /// none of the events sent to gauge
+                logger.debug(withMessage: "notified all events deletion failed", category: .gauge)
+                completion?(.failure(NSError(domain: "All events network calls failed", code: 1, userInfo: nil)))
+            default:
+                /// partial success or failure
+                self?.deleteEventsData(context: context, eventResults: allSuccessfulEvents)
+                completion?(.success(()))
+            }
+
+            self?.dataDeletionDispatchGroup?.notify(queue: DispatchQueue.global(qos: .background)) {
+                logger.debug(withMessage: "notified data delete dispatch group", category: .gauge)
+                self?.eventNetworkResults = []
+                self?.sessionsFetchedData = []
+                self?.fetchedData = []
+                self?.dataDeletionDispatchGroup = nil
+            }
+            self?.eventsDispatchGroup = nil
+        }
+    }
+
+    func deleteEventsData(context: NSManagedObjectContext, eventResults: [EventNetworkResult]?) {
+        eventResults?.forEach { eventResult in
+            let eventsFetchReq = eventResult.eventFetchRequest
+            dataDeletionDispatchGroup?.enter()
+            self.persistenceManager.deleteEvents(fetchRequest: eventsFetchReq, context: context) { [weak self] result in
+                switch result {
+                case .success:
+                    logger.debug(withMessage: "deleted events in the iteration \(eventResult.events)", category: .gauge)
+                    self?.dataDeletionDispatchGroup?.leave()
+                case .failure(let error):
+                    logger.debug(withMessage: "unable to delete the events in the iteration \(eventResult.events) with error \(error)", category: .gauge)
+                    self?.dataDeletionDispatchGroup?.leave()
+                    self?.deleteEventsData(context: context, eventResults: eventResults)
+                }
+            }
+        }
+    }
+
+    func deleteGaugeData() {
+        fetchedData.forEach { gauge in
+            dataDeletionDispatchGroup?.enter()
+            self.persistenceManager.deleteGauge(gauge: gauge) { [weak self] result in
+                switch result {
+                case .success:
+                    logger.debug(withMessage: "successfully deleted gauge entry \(gauge)", category: .gauge)
+                    self?.dataDeletionDispatchGroup?.leave()
+                case .failure(let error):
+                    logger.debug(withMessage: "failed to deleted gauge \(gauge) with \(error)", category: .gauge)
+                    self?.dataDeletionDispatchGroup?.leave()
+                }
+            }
+        }
+    }
+
+    func deleteSessionsData() {
+        sessionsFetchedData.forEach { session in
+            dataDeletionDispatchGroup?.enter()
+            persistenceManager.deleteSession(session: session) { [weak self] result in
+                switch result {
+                case .success:
+                    self?.dataDeletionDispatchGroup?.leave()
+                    logger.debug(withMessage: "deleted session \(session)", category: .gauge)
+                case .failure(let error):
+                    logger.debug(withMessage: "failed to delete session \(session) \(error)", category: .gauge)
+                    self?.dataDeletionDispatchGroup?.leave()
+                }
+            }
+        }
+    }
+
+    func flushAllGaugeData(gaugeData: [Gauge]) {
+        gaugeData.forEach { gauge in
+            let isLatestGauge = gauge == gaugeData.first
+            flushSessionsInGauge(isLatestGauge: isLatestGauge, gauge: gauge)
+
+            // Adding only obsolete gauge data for deletion.
+            if !isLatestGauge {
+                logger.debug(withMessage: "Gauge Deletion: gauge \(gauge.id ?? "")", category: .gauge)
+                fetchedData.append(gauge)
+            }
+        }
+    }
+
+    private func flushSessionsInGauge(isLatestGauge: Bool, gauge: Gauge) {
+        let sessions = persistenceManager.fetchSessionsInGaugeEntry(gauge: gauge)
+        guard let sessionsData = sessions?.data,
+              !sessionsData.isEmpty else {
+            logger.debug(withMessage: "no sessions data available in gauge entry \(gauge.id ?? "")", category: .gauge)
+            return
+        }
+
+        sessionsData.forEach { [weak self] session in
+            logger.debug(withMessage: "sessionId \(String(describing: session.id)) in the gauge \(gauge.id ?? "")", category: .gauge)
+            self?.flushEventsInSession(session: session, gauge: gauge)
+            guard isLatestGauge else {
+                sessionsFetchedData.append(session)
+                return
+            }
+            // adding only obsolete sessions of latest gauge for deletion, as latest session is still used for logging events
+            if session != sessionsData.first {
+                sessionsFetchedData.append(session)
+            }
+        }
+    }
+
+    private func flushEventsInSession(session: Session, gauge: Gauge) {
+        let eventsCount = persistenceManager.getEventCountInSession(session: session)
+        logger.debug(withMessage: "no of events in the session \(eventsCount)", category: .gauge)
+
+        guard eventsCount > 0 else {
+            logger.debug(withMessage: "no events in the session \(session.id ?? "")", category: .gauge)
+            return
+        }
+
+        let noOfIterations = getNumberOfEventCallIterations(eventsCount)
+
+        (1...noOfIterations).forEach { _ in
+            let events = persistenceManager.fetchEventsInSessionEntry(session: session)
+            guard let eventsData = events?.data,
+                  !eventsData.isEmpty,
+                  let eventsFetchReq = events?.fetchRequest else {
+                logger.debug(withMessage: "no events data available in session entry \(session.id ?? "")", category: .gauge)
+                return
+            }
+
+            let eventsDataObjects = getEventsDataFromEvents(events: eventsData)
+            guard !eventsDataObjects.isEmpty else {
+                logger.debug(withMessage: "unable to create events model objects", category: .gauge)
+                return
+            }
+
+            logger.debug(withMessage: "eventsDataObjects to be sent to network.. \(eventsDataObjects)", category: .gauge)
+            let sessionId = session.id ?? UUID().uuidString
+            let gaugeRequest = buildGaugeRequestModel(gauge: gauge, sessionId: sessionId, eventsData: eventsDataObjects)
+            eventsDispatchGroup?.enter()
+            flushEventsToServer(gaugeRequestModel: gaugeRequest) { [weak self] result in
+                guard case .success = result else {
+                    self?.eventNetworkResults.append(EventNetworkResult(isSuccess: false,
+                                                                        events: eventsData,
+                                                                        eventFetchRequest: eventsFetchReq))
+                    self?.eventsDispatchGroup?.leave()
+                    return
+                }
+                self?.eventNetworkResults.append(EventNetworkResult(isSuccess: true,
+                                                                    events: eventsData,
+                                                                    eventFetchRequest: eventsFetchReq))
+                self?.eventsDispatchGroup?.leave()
+            }
+        }
+    }
+
+    func getNumberOfEventCallIterations(_ eventsCount: Int) -> Int {
+        let noOfIterations = Int(ceil(Double(eventsCount) / Double(GaugeRemoteFlagManager.eventsLimit)))
+        return noOfIterations
+    }
+
+    func buildGaugeRequestModel(gauge: Gauge, sessionId: String, eventsData: [EventDataRequest]) -> GaugeRequestModel {
+        var userInfo: UserInfo?
+        if let user = gauge.user, !user.isEmpty {
+            userInfo = try?JSONDecoder().decode(UserInfo.self, from: Data(user.utf8))
+        }
+
+        let osInfo = OSInfo(version: gauge.osVersion,
+                            name: deviceData.systemName)
+
+        let appInfo = AppInfo(versionNumber: gauge.appVersion ?? "",
+                              versionCode: gauge.appVersionCode ?? "",
+                              installedOn: gauge.appInstalledOn ?? "")
+
+        let requestModel = GaugeRequestModel(anonymousId: gauge.anonymousId ?? "",
+                                             app: appInfo,
+                                             appId: GaugeConstants.appId,
+                                             device: GaugeConstants.deviceInfo,
+                                             events: eventsData,
+                                             os: osInfo,
+                                             sdkVersion: gauge.sdkVersion ?? "",
+                                             sentAt: Date(),
+                                             sessionId: sessionId,
+                                             user: userInfo)
+        return requestModel
+    }
+
+    func getEventsDataFromEvents(events: [Event]) -> [EventDataRequest] {
+        return events.compactMap { event -> EventDataRequest? in
+            guard let name = event.name,
+                  let type = event.type else {
+                return nil
+            }
+
+            let attributes = event.attributes?.stringToDictionary ?? [:]
+            return EventDataRequest(trackedAt: event.trackedAt ?? Date(),
+                                    attributes: attributes,
+                                    eventName: name,
+                                    eventType: type)
+        }
+    }
+
+    func flushEventsToServer(gaugeRequestModel: GaugeRequestModel, completion: GaugeCompletion? = nil) {
+        connector.sendEvents(requestModel: gaugeRequestModel) { result in
+            switch result {
+            case .success:
+                logger.debug(withMessage: "network call successfully sent events to Gauge Server request model \(gaugeRequestModel)", category: .gauge)
+                completion?(.success(Void()))
+            case .failure(let error):
+                logger.debug(withMessage: "network call failed to send events to Gauge Server with error \(error) request model \(gaugeRequestModel)", category: .gauge)
+                completion?(.failure(error))
+            }
+        }
+    }
+}
